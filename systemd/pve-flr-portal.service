@@ -1,0 +1,24 @@
+[Unit]
+Description=File Level Restore Portal for Proxmox Backup Server (pve-flr-portal)
+Documentation=https://github.com/treycentric/pve-flr-portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pveflr
+Group=pveflr
+WorkingDirectory=/opt/pve-flr-portal
+Environment=PYTHONUNBUFFERED=1
+Environment=PFR_DATA_DIR=%S/pve-flr-portal
+ExecStart=/opt/pve-flr-portal/.venv/bin/python run.py
+Restart=always
+RestartSec=5
+StateDirectory=pve-flr-portal
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/pve-flr-portal
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
