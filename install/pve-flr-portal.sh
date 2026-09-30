@@ -11,6 +11,7 @@
 # Usage:
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FileLevelRestoreProxmox/main/install/pve-flr-portal.sh)"
 #   CT_ID=150 CORES=2 RAM=2048 DISK=8 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FileLevelRestoreProxmox/main/install/pve-flr-portal.sh)"
+#   PVE_HOST=192.168.178.2 PVE_STORAGE=pbs bash pve-flr-portal.sh   # PVE-Zugang direkt setzen (ohne Abfrage)
 #   bash pve-flr-portal.sh --ctid 150 --cores 1 --memory 1024 --disk 4 --bridge vmbr0 --debug
 #
 # Installer-Repo: https://github.com/HatchetMan111/FileLevelRestoreProxmox
@@ -50,6 +51,11 @@ CT_ID_ARG="${CT_ID:-${CTID:-}}"
 CORES_ARG="${CORES:-$DEFAULT_CORES}"
 RAM_ARG="${RAM:-$DEFAULT_RAM}"
 DISK_ARG="${DISK:-$DEFAULT_DISK}"
+# PVE-Zugang für die App-.env (ohne diese scheitert jeder Login mit HTTP 500,
+# da PVE_HOST dann nicht auflösbar ist – siehe Troubleshooting in README.md):
+# per Flag, per ENV oder interaktiv (nur bei TTY) – sonst Platzhalter + Warnung.
+PVE_HOST_ARG="${PVE_HOST:-}"
+PVE_STORAGE_ARG="${PVE_STORAGE:-pbs}"
 
 DEBUG="${DEBUG:-0}"
 LOG_FILE="/tmp/${APP}-install-$(date +%F-%H%M%S).log"
@@ -97,6 +103,8 @@ Optionen:
   --bridge NAME        Netzwerk-Bridge (Default: ${DEFAULT_BRIDGE})
   --password PW        Root-Passwort (Default: zufällig generiert, wird angezeigt)
   --ssh-key PATH       SSH Public Key in den Container übernehmen (optional)
+  --pve-host IP/NAME   PVE-Host für die App (Default: ENV PVE_HOST, sonst Abfrage)
+  --pve-storage ID     PBS-Storage-ID für die App (Default: ENV PVE_STORAGE oder 'pbs', sonst Abfrage)
   --debug              bash -x + maximale Fehlermeldungskette
   -h, --help           diese Hilfe
 EOF
@@ -107,7 +115,7 @@ EOF
 # ---------------------------------------------------------------------------
 CT_ID="$CT_ID_ARG" HOSTNAME_ARG="$APP" CORES="$CORES_ARG" RAM="$RAM_ARG" DISK="$DISK_ARG"
 STORAGE_ARG="" TEMPLATE_STORE="$DEFAULT_TEMPLATE_STORE" BRIDGE="$DEFAULT_BRIDGE"
-PASSWORD_ARG="" SSH_KEY_ARG=""
+PASSWORD_ARG="" SSH_KEY_ARG="" PVE_HOST="$PVE_HOST_ARG" PVE_STORAGE_ID="$PVE_STORAGE_ARG"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ctid) CT_ID="$2"; shift 2;;
@@ -120,6 +128,8 @@ while [[ $# -gt 0 ]]; do
     --bridge) BRIDGE="$2"; shift 2;;
     --password) PASSWORD_ARG="$2"; shift 2;;
     --ssh-key) SSH_KEY_ARG="$2"; shift 2;;
+    --pve-host) PVE_HOST="$2"; shift 2;;
+    --pve-storage) PVE_STORAGE_ID="$2"; shift 2;;
     --debug) DEBUG="1"; set -x; shift;;
     -h|--help) usage; exit 0;;
     *) msg_error "Unbekannte Option: $1"; usage; exit 1;;
@@ -147,6 +157,28 @@ if [[ -z "$STORAGE_ARG" ]]; then
 fi
 [[ -n "$STORAGE_ARG" ]] || { msg_error "Kein RootFS-Storage gefunden."; exit 1; }
 msg_info "Storage: $STORAGE_ARG | Template-Store: $TEMPLATE_STORE | Bridge: $BRIDGE"
+
+# ---------------------------------------------------------------------------
+# 1b. PVE-Zugang für die App-.env (ohne gültigen PVE_HOST scheitert jeder
+#     Login mit HTTP 500: "Name or service not known" im Journal)
+# ---------------------------------------------------------------------------
+# Reihenfolge: Flag/ENV > interaktive Abfrage (nur bei TTY, kein Hängen bei
+# Pipe/CI) > Platzhalter aus .env.example + fette Warnung am Ende.
+if [[ -z "$PVE_HOST" ]]; then
+  if [[ -t 0 ]]; then
+    DETECTED_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    PVE_INPUT=""
+    read -r -p "  PVE_HOST – IP/Hostname des Proxmox-Hosts für die App-API [${DETECTED_IP:-keine erkannt}]: " PVE_INPUT || true
+    PVE_HOST="${PVE_INPUT:-${DETECTED_IP:-}}"
+  fi
+  [[ -z "$PVE_HOST" ]] && msg_warn "Kein PVE_HOST angegeben (nicht-interaktiv?) – .env behält den Platzhalter, Login wird mit HTTP 500 scheitern!"
+fi
+if [[ -t 0 ]]; then
+  STORAGE_INPUT=""
+  read -r -p "  PVE_STORAGE – PBS-Storage-ID für die App [${PVE_STORAGE_ID}]: " STORAGE_INPUT || true
+  PVE_STORAGE_ID="${STORAGE_INPUT:-$PVE_STORAGE_ID}"
+fi
+[[ -n "$PVE_HOST" ]] && msg_info "PVE_HOST=$PVE_HOST  PVE_STORAGE=$PVE_STORAGE_ID"
 
 # ---------------------------------------------------------------------------
 # 2. Template sicherstellen (neuestes debian-12-standard)
@@ -251,6 +283,18 @@ pct exec "$CT_ID" -- bash -c '
 # Hinweis: bewusst kein '| tail' hier – mit pipefail würde der trap sonst
 # die Pipe (tail) statt des gescheiterten pct-Befehls melden. Voll-Output steht im Log.
 
+# PVE-Zugang in die App-.env schreiben (VOR enable --now, damit der erste
+# Start schon die richtige Config hat). pct exec ohne Shell – die Host-Seite
+# expandiert $PVE_HOST/$PVE_STORAGE_ID direkt als sed-Argumente.
+if [[ -n "$PVE_HOST" ]]; then
+  pct exec "$CT_ID" -- sed -i "s|^PVE_HOST=.*|PVE_HOST=${PVE_HOST}|" /opt/pve-flr-portal/.env
+  msg_ok "PVE_HOST=${PVE_HOST} in Container-.env gesetzt."
+fi
+if [[ -n "$PVE_STORAGE_ID" ]]; then
+  pct exec "$CT_ID" -- sed -i "s|^PVE_STORAGE=.*|PVE_STORAGE=${PVE_STORAGE_ID}|" /opt/pve-flr-portal/.env
+  msg_ok "PVE_STORAGE=${PVE_STORAGE_ID} in Container-.env gesetzt."
+fi
+
 # systemd-Unit aus Repo übernehmen (fällt auf Inline-Unit zurück).
 # Upstream-Template enthält __APP_DIR__/__APP_USER__-Platzhalter und
 # Restart=on-failure – wir brauchen konkrete Pfade + Restart=always.
@@ -315,6 +359,24 @@ done
   || { msg_error "Web UI antwortet nicht auf https://localhost:${APP_PORT}/."; pct exec "$CT_ID" -- systemctl status pve-flr-portal --no-pager || true; pct exec "$CT_ID" -- journalctl -u pve-flr-portal --no-pager -n 100 || true; exit 1; }
 msg_ok "Web UI antwortet (HTTPS 200 auf localhost:${APP_PORT}/, -k wegen Self-Signed)."
 
+# PVE-API vom Container aus erreichbar? Genau dieser Call (auth.login) war es,
+# der bei unkonfiguriertem PVE_HOST jeden Login mit HTTP 500 scheitern ließ
+# ("Name or service not known"). Darum harter Check mit klarem Urteil.
+msg_info "Prüfe PVE-API vom Container aus ..."
+PVE_API_OK=0
+PVE_HOST_EFFECTIVE="$(pct exec "$CT_ID" -- grep -E "^PVE_HOST=" /opt/pve-flr-portal/.env 2>/dev/null | cut -d= -f2- || true)"
+if [[ -n "${PVE_HOST_EFFECTIVE:-}" && "$PVE_HOST_EFFECTIVE" != "<hostname or IP of PVE host>" ]]; then
+  if pct exec "$CT_ID" -- curl -ks -m 10 "https://${PVE_HOST_EFFECTIVE}:8006/api2/json/version" 2>/dev/null | grep -q '"version"'; then
+    PVE_API_OK=1
+  fi
+fi
+if [[ "$PVE_API_OK" == "1" ]]; then
+  msg_ok "PVE-API erreichbar (https://${PVE_HOST_EFFECTIVE}:8006 antwortet)."
+else
+  msg_warn "PVE-API NICHT erreichbar (PVE_HOST='${PVE_HOST_EFFECTIVE:-<leer>}') – jeder Login wird mit HTTP 500 scheitern!"
+  msg_warn "Fix: PVE_HOST in der .env setzen + Service neu starten (siehe Banner unten)."
+fi
+
 # Finale IP erneut auflösen (DHCP kann sich während des Setups geändert haben)
 CT_IP="$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}')"
 
@@ -328,8 +390,14 @@ echo "  Web UI       : https://${CT_IP}:${APP_PORT}"
 echo "                 (Browser warnt beim ersten Aufruf vor Self-Signed – erwartet.)"
 echo "  Root-Passwort: ${PASSWORD_ARG:-<bestehender CT, unverändert>} (nur jetzt angezeigt!)"
 echo "  Service      : systemctl status pve-flr-portal  (im Container via: pct enter $CT_ID)"
-echo "  Config       : pct exec $CT_ID -- nano /opt/pve-flr-portal/.env"
-echo "                 (PVE_HOST + PVE_STORAGE setzen, dann: pct exec $CT_ID -- systemctl restart pve-flr-portal)"
+if [[ "$PVE_API_OK" == "1" ]]; then
+echo "  PVE-API      : https://${PVE_HOST_EFFECTIVE}:8006 erreichbar – Login sollte funktionieren."
+echo "                 Storage-ID 'pbs' ggf. prüfen: pvesm status (muss PBS-Storage sein)."
+else
+echo "  !!! PVE-HOST NICHT KONFIGURIERT/ERREICHBAR – LOGIN SCHEITERT MIT HTTP 500 !!!"
+echo "  Fix          : pct exec $CT_ID -- nano /opt/pve-flr-portal/.env"
+echo "                 (PVE_HOST=<PVE-IP> + PVE_STORAGE=<PBS-ID> setzen, dann: pct exec $CT_ID -- systemctl restart pve-flr-portal)"
+fi
 echo "  PVE-Rolle    : pveum role add FileRestoreReader -privs \"Datastore.AllocateSpace,VM.Backup,VM.Audit\""
 echo "  Update       : Skript erneut laufen lassen (idempotent, fetch + latest Tag + pip + restart)"
 echo "  Deinstall    : pct stop $CT_ID && pct destroy $CT_ID"

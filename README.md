@@ -16,9 +16,13 @@ Anpassungen per Umgebungsvariable oder Flag (ID immer **nächste freie**, außer
 
 ```bash
 CT_ID=150 CORES=2 RAM=2048 DISK=8 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FileLevelRestoreProxmox/main/install/pve-flr-portal.sh)"
-bash install/pve-flr-portal.sh --ctid 150 --cores 1 --memory 1024 --disk 4 --bridge vmbr0 --storage local-lvm
+PVE_HOST=192.168.178.2 PVE_STORAGE=pbs bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FileLevelRestoreProxmox/main/install/pve-flr-portal.sh)"
+bash install/pve-flr-portal.sh --ctid 150 --cores 1 --memory 1024 --disk 4 --bridge vmbr0 --storage local-lvm --pve-host 192.168.178.2 --pve-storage pbs
 bash install/pve-flr-portal.sh --debug   # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/pve-flr-portal-install-*.log
 ```
+
+Ohne `--pve-host`/`PVE_HOST` fragt das Script interaktiv (nur bei TTY, Default-Vorschlag = Host-IP);
+ohne Angabe bleibt der `.env`-Platzhalter und das Banner warnt fett, dass jeder Login mit HTTP 500 scheitert.
 
 > Die systemd-Unit liegt unter `systemd/pve-flr-portal.service` desselben Repos und wird
 > vom Installer per Download übernommen (Fallback: Inline-Unit im Script).
@@ -45,10 +49,14 @@ Das Skript (`set -euo pipefail`, idempotent, `trap ERR` mit Befehl+Zeile+Exit-Co
 3. installiert im Container Python+venv+git, legt System-User `pveflr` an,
    klont/pullt `treycentric/pve-flr-portal` nach `/opt/pve-flr-portal`,
    checkt das neueste `v*.*.*`-Tag aus (Upstream-Release-Kanal), installiert
-   `requirements.txt`, legt `.env` aus `.env.example` an (falls fehlt),
+   `requirements.txt`, legt `.env` aus `.env.example` an (falls fehlt) und
+   schreibt `PVE_HOST`/`PVE_STORAGE` (Flag/ENV/Abfrage) direkt hinein,
    schreibt `pve-flr-portal.service`, `systemctl enable --now pve-flr-portal`,
 4. verifiziert `systemctl is-active pve-flr-portal` + HTTPS auf `localhost:8008/`
-   (`curl -k` wegen Self-Signed) und gibt die finale URL + Container-IP aus.
+   (`curl -k` wegen Self-Signed) **+ PVE-API-Erreichbarkeit**
+   (`curl -k https://<PVE_HOST>:8006/api2/json/version` aus dem Container)
+   und gibt die finale URL + Container-IP aus. Ist PVE nicht erreichbar,
+   warnt das Banner fett, dass jeder Login mit HTTP 500 scheitert.
 
 Erwartete Schlussausgabe (Beispiel):
 
@@ -67,14 +75,18 @@ Erwartete Schlussausgabe (Beispiel):
 ══════════════════════════════════════════════════════════
 ```
 
-## Nach der Installation (Pflicht: PVE-Zugang konfigurieren)
+## Nach der Installation (PVE-Zugang prüfen)
 
-Ohne `.env` + PVE-Rolle zeigt die UI nur den Login ohne Daten:
+Wurde `PVE_HOST`/`PVE_STORAGE` bei der Installation gesetzt (Flag/ENV/Abfrage),
+ist die `.env` bereits korrekt und das Banner zeigt „PVE-API erreichbar".
+Sonst nachholen:
 
 ```bash
 pct exec 100 -- nano /opt/pve-flr-portal/.env
 # PVE_HOST=<PVE-IP> PVE_STORAGE=<PBS-Storage-ID> setzen
 pct exec 100 -- systemctl restart pve-flr-portal
+# Verify: kein "Could not fetch realms" mehr im Journal
+pct exec 100 -- journalctl -u pve-flr-portal --no-pager -n 20
 ```
 
 Auf dem PVE-Host (einmalig):
@@ -109,6 +121,11 @@ pct stop 100 && pct destroy 100             # Deinstall
 - Jeder Fehler gibt Befehl + Zeile + Exit-Code aus, Voll-Log unter `/tmp/pve-flr-portal-install-*.log`.
 - `bash install/pve-flr-portal.sh --debug` für `bash -x`-Trace.
 - Im Container: `systemctl status pve-flr-portal --no-pager`, `journalctl -u pve-flr-portal -n 100`.
+- **Login → „Internal Server Error"**: fast immer `PVE_HOST` falsch/nicht gesetzt.
+  Im Journal steht dann `httpx.ConnectError: [Errno -2] Name or service not known`
+  bei `backend/auth.py, line 115, in login` plus `Could not fetch realms from PVE`.
+  Fix: `PVE_HOST` (IP statt Hostname umgeht DNS) in der `.env` setzen + `systemctl restart pve-flr-portal`.
+  „Invalid username or password" dagegen heißt: PVE ist erreichbar, Credentials/Rolle prüfen.
 
 ## Dateien
 
